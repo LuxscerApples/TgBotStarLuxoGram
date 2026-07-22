@@ -14,6 +14,9 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import logging
+logging.basicConfig(level=logging.INFO)
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
@@ -214,6 +217,8 @@ async def cmd_activate(message: Message):
     await save_codes(codes)
     await set_rank(message.from_user.id, RANK_VERIFIED)
     await message.answer("✅ Промокод активирован! Вам выдана роль \"Верифицированный\".")
+
+
 
 
 FIAT_SYMBOLS = {
@@ -554,7 +559,8 @@ async def cmd_pickup(message: Message):
     await message.answer(f"✅ У @{username} забрана верификация.")
 
 
-@router.message(Command("search"))
+
+@router.message(Command(commands=["search"]))
 async def cmd_search(message: Message):
     rank = await get_rank(message.from_user.id)
     if rank not in (RANK_VERIFIED, RANK_OWNER):
@@ -572,15 +578,15 @@ async def cmd_search(message: Message):
     await message.answer(f"🔍 Поиск в Яндексе:\n{yandex_url}", disable_web_page_preview=True)
 
 
-@router.message(Command("botinfo"))
+@router.message(Command(commands=["botinfo"]))
 async def cmd_botinfo(message: Message):
     await ensure_user(message.from_user.id, message.from_user.username)
     info_text = (
         "Информация о боте:\n"
-        "📄Язык программирования: Python.\n"
-        "📚Библиотека: Aiogram.\n"
-        "👨‍💻Кодер: @Luxscer.\n"
-        "📊Стадия в разработке: Beta."
+        "📄 Язык программирования: Python.\n"
+        "📚 Библиотека: Aiogram.\n"
+        "👨‍💻 Кодер: @Luxscer.\n"
+        "📊 Стадия в разработке: Beta."
     )
     await message.answer(info_text)
 
