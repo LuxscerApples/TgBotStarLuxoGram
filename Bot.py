@@ -394,7 +394,7 @@ async def cmd_verifiedchat(message: Message):
     if rank not in (RANK_VERIFIED, RANK_OWNER):
         await message.answer(NO_RIGHTS_TEXT)
         return
-    await message.answer("✅ Наш чат – https://t.me/LuxoGramTalk.", disable_web_page_preview=True)
+    await message.answer("✅ Наш чат – https://t.me/+QoviFPVI_BE1MDUy.", disable_web_page_preview=True)
 
 
 @router.message(Command("chance"))
