@@ -6,6 +6,7 @@ import ast
 import operator
 from pathlib import Path
 from typing import Optional
+import urllib.parse
 
 import aiohttp
 from aiogram import Bot, Dispatcher, Router, F
@@ -138,10 +139,13 @@ HELP_TEXT = (
     "/verifiedchat – ссылка на чат\n"
     "/questionnaire – анкета пользователя\n"
     "/chance текст или текст – рандомный выбор\n"
-    "/cubes @юз – бросить кубики\n\n"
+    "/cubes @юз – бросить кубики\n"
+    "/search текст – поиск в Яндексе\n\n"
     "🔹 Управляющий:\n"
     "/passcreate текст @юз – создать промокод\n"
-    "/pickup @юз – забрать верификацию\n"
+    "/pickup @юз – забрать верификацию\n\n"
+    "🔹 Для всех:\n"
+    "/botinfo – информация о боте\n"
 )
 
 GUIDE_TEXT = (
@@ -548,6 +552,37 @@ async def cmd_pickup(message: Message):
     uid, _info = found
     await set_rank(int(uid), RANK_UNVERIFIED)
     await message.answer(f"✅ У @{username} забрана верификация.")
+
+
+@router.message(Command("search"))
+async def cmd_search(message: Message):
+    rank = await get_rank(message.from_user.id)
+    if rank not in (RANK_VERIFIED, RANK_OWNER):
+        await message.answer(NO_RIGHTS_TEXT)
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Укажите текст для поиска: /search ваш запрос")
+        return
+
+    query = parts[1].strip()
+    encoded_query = urllib.parse.quote(query)
+    yandex_url = f"https://yandex.ru/search/?text={encoded_query}"
+    await message.answer(f"🔍 Поиск в Яндексе:\n{yandex_url}", disable_web_page_preview=True)
+
+
+@router.message(Command("botinfo"))
+async def cmd_botinfo(message: Message):
+    await ensure_user(message.from_user.id, message.from_user.username)
+    info_text = (
+        "Информация о боте:\n"
+        "📄Язык программирования: Python.\n"
+        "📚Библиотека: Aiogram.\n"
+        "👨‍💻Кодер: @Luxscer.\n"
+        "📊Стадия в разработке: Beta."
+    )
+    await message.answer(info_text)
 
 
 async def main():
