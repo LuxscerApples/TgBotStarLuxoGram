@@ -1,379 +1,564 @@
-import os
 import asyncio
+import json
+import os
 import random
-import logging
+import ast
+import operator
+from pathlib import Path
+from typing import Optional
+
 import aiohttp
-import sqlite3
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.enums import ParseMode
-from dotenv import load_dotenv
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-load_dotenv()
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+AI_MODEL = os.environ.get("AI_MODEL", "openai/gpt-4o-mini")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+USERS_FILE = DATA_DIR / "users.json"
+CODES_FILE = DATA_DIR / "codes.json"
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
+RANK_UNVERIFIED = "unverified"
+RANK_VERIFIED = "verified"
+RANK_OWNER = "owner"
+
+RANK_NAMES = {
+    RANK_UNVERIFIED: "Неверифицированный",
+    RANK_VERIFIED: "Верифицированный",
+    RANK_OWNER: "Управляющий",
+}
+
+NO_RIGHTS_TEXT = "Вы не можете выполнить эту команду, так как у вас нет нужного ранга."
+
+storage_lock = asyncio.Lock()
+
+
+def _read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+
+def _write_json(path: Path, data: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+async def get_users() -> dict:
+    async with storage_lock:
+        return _read_json(USERS_FILE)
+
+
+async def save_users(data: dict) -> None:
+    async with storage_lock:
+        _write_json(USERS_FILE, data)
+
+
+async def get_codes() -> dict:
+    async with storage_lock:
+        return _read_json(CODES_FILE)
+
+
+async def save_codes(data: dict) -> None:
+    async with storage_lock:
+        _write_json(CODES_FILE, data)
+
+
+async def ensure_user(user_id: int, username: Optional[str]) -> dict:
+    users = await get_users()
+    uid = str(user_id)
+    username = username or ""
+    if uid not in users:
+        users[uid] = {"username": username, "rank": RANK_UNVERIFIED}
+        await save_users(users)
+    elif users[uid].get("username") != username:
+        users[uid]["username"] = username
+        await save_users(users)
+    return users[uid]
+
+
+async def get_rank(user_id: int) -> str:
+    if user_id == OWNER_ID:
+        return RANK_OWNER
+    users = await get_users()
+    uid = str(user_id)
+    if uid not in users:
+        return RANK_UNVERIFIED
+    return users[uid].get("rank", RANK_UNVERIFIED)
+
+
+async def set_rank(user_id: int, rank: str) -> None:
+    users = await get_users()
+    uid = str(user_id)
+    if uid not in users:
+        users[uid] = {"username": "", "rank": rank}
+    else:
+        users[uid]["rank"] = rank
+    await save_users(users)
+
+
+async def find_user_by_username(username: str) -> Optional[tuple]:
+    username = username.lstrip("@").lower()
+    users = await get_users()
+    for uid, info in users.items():
+        if info.get("username", "").lower() == username:
+            return uid, info
+    return None
+
+
 router = Router()
-dp.include_router(router)
 
-conn = sqlite3.connect("bot_data.db")
-cursor = conn.cursor()
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        rank TEXT DEFAULT 'unverified'
-    )
-""")
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS promocodes (
-        code TEXT PRIMARY KEY,
-        used INTEGER DEFAULT 0,
-        target_user_id INTEGER
-    )
-""")
-conn.commit()
+HELP_TEXT = (
+    "📋 Список команд:\n\n"
+    "🔹 Неверифицированный:\n"
+    "/start – запустить бота\n"
+    "/help – список команд\n"
+    "/questionnaire – анкета пользователя\n"
+    "/guide – как пройти верификацию\n"
+    "/activate текст – активировать промокод\n\n"
+    "🔹 Верифицированный:\n"
+    "/start – запустить бота\n"
+    "/help – список команд\n"
+    "/activate текст – активировать промокод\n"
+    "/currency – курс валют\n"
+    "/calculator пример – калькулятор\n"
+    "/ai текст – спросить ИИ\n"
+    "/guide – как пройти верификацию\n"
+    "/verifiedchat – ссылка на чат\n"
+    "/questionnaire – анкета пользователя\n"
+    "/chance текст или текст – рандомный выбор\n"
+    "/cubes @юз – бросить кубики\n\n"
+    "🔹 Управляющий:\n"
+    "/passcreate текст @юз – создать промокод\n"
+    "/pickup @юз – забрать верификацию\n"
+)
 
-def get_rank(user_id: int) -> str:
-    cursor.execute("SELECT rank FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    return result[0] if result else "unverified"
-
-def set_rank(user_id: int, username: str, rank: str):
-    cursor.execute("INSERT OR REPLACE INTO users (user_id, username, rank) VALUES (?, ?, ?)", (user_id, username, rank))
-    conn.commit()
-
-def check_rank(required: str):
-    ranks = {"unverified": 0, "verified": 1, "owner": 2}
-    async def decorator(message: Message):
-        user_rank = get_rank(message.from_user.id)
-        if ranks.get(user_rank, 0) < ranks.get(required, 0):
-            await message.answer("Вы не можете выполнить эту команду, так как у вас нет нужного ранга.")
-            return False
-        return True
-    return decorator
+GUIDE_TEXT = (
+    "✅ Как пройти верификацию:\n\n"
+    "1) Зайти в чат https://t.me/LuxoGram_verification.\n\n"
+    "2) Написать чем ты занимаешься, например: если ты программист написать "
+    "\"Я программист, пишу на языке программирования ... , На библиотеке ... , Мой проект ...\"\n\n"
+    "3) Ждать, если ты подходишь, тебе напишут в лс или в ответ на сообщение."
+)
 
 
-@router.message(CommandStart())
+@router.message(Command("start"))
 async def cmd_start(message: Message):
-    set_rank(message.from_user.id, message.from_user.username or "unknown", "unverified")
+    await ensure_user(message.from_user.id, message.from_user.username)
     await message.answer(
         "Приветствую! Это бот-помощник для верифицированных людей, /guide, "
         "чтобы получить роль \"верифицированный\", /help для полного списка команд."
     )
 
+
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    user_rank = get_rank(message.from_user.id)
-    text = "📋 <b>Список команд:</b>\n\n"
-    text += "👤 <b>Неверифицированный:</b>\n"
-    text += "/start - Начать работу\n"
-    text += "/help - Список команд\n"
-    text += "/questionnaire - Анкета\n"
-    text += "/guide - Гайд по верификации\n"
-    text += "/activate <текст> - Активировать промокод\n\n"
-    if user_rank in ("verified", "owner"):
-        text += "💎 <b>Верифицированный:</b>\n"
-        text += "/currency - Курс валют\n"
-        text += "/calculator <пример> - Калькулятор\n"
-        text += "/ai <текст> - ИИ-помощник\n"
-        text += "/guide - Гайд\n"
-        text += "/verifiedchat - Наш чат\n"
-        text += "/questionnaire - Анкета\n"
-        text += "/chance <текст или текст> - Случайный выбор\n"
-        text += "/cubes @user - Игра в кубики\n\n"
-    if user_rank == "owner":
-        text += "👑 <b>Управляющий:</b>\n"
-        text += "/passcreate <текст> @user - Создать промокод\n"
-        text += "/pickup @user - Забрать верификацию\n"
-    await message.answer(text)
+    await ensure_user(message.from_user.id, message.from_user.username)
+    await message.answer(HELP_TEXT)
+
 
 @router.message(Command("questionnaire"))
 async def cmd_questionnaire(message: Message):
-    user = message.from_user
-    rank = get_rank(user.id)
-    rank_names = {"unverified": "Неверифицированный", "verified": "Верифицированный", "owner": "Управляющий"}
-    text = (
-        "📊 <b>Анкета:</b>\n\n"
-        f"👤 Username – @{user.username if user.username else 'не указан'}\n"
-        f"🆔 Telegram id – {user.id}\n"
-        f"💎 Ранг – {rank_names.get(rank, 'Неверифицированный')}"
+    await ensure_user(message.from_user.id, message.from_user.username)
+    rank = await get_rank(message.from_user.id)
+    username = message.from_user.username or "—"
+    await message.answer(
+        "📊 Анкета:\n"
+        f"👤 Username – @{username}\n"
+        f"🆔 Telegram id – {message.from_user.id}\n"
+        f"💎 Ранг – {RANK_NAMES[rank]}"
     )
-    await message.answer(text)
+
 
 @router.message(Command("guide"))
 async def cmd_guide(message: Message):
-    text = (
-        "✅ <b>Как пройти верификацию:</b>\n\n"
-        "1) Зайти в чат https://t.me/LuxoGram_verification.\n\n"
-        "2) Написать чем ты занимаешься, например: если ты программист написать "
-        "\"Я программист, пишу на языке программирования ..., На библиотеке ..., Мой проект ...\n\n"
-        "3) Ждать, если ты подходишь, тебе напишут в лс или в ответ на сообщение."
-    )
-    await message.answer(text)
+    await ensure_user(message.from_user.id, message.from_user.username)
+    await message.answer(GUIDE_TEXT, disable_web_page_preview=True)
+
 
 @router.message(Command("activate"))
-async def cmd_activate(message: Message, command: CommandObject):
-    if not command.args:
-        await message.answer("Введите промокод: /activate <текст>")
+async def cmd_activate(message: Message):
+    await ensure_user(message.from_user.id, message.from_user.username)
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Укажите промокод: /activate текст")
         return
-    code = command.args.strip()
-    cursor.execute("SELECT used, target_user_id FROM promocodes WHERE code = ?", (code,))
-    result = cursor.fetchone()
-    if not result:
-        await message.answer("❌ Неверный промокод.")
+    code = parts[1].strip()
+    codes = await get_codes()
+    entry = codes.get(code)
+    if not entry or entry.get("used"):
+        await message.answer("❌ Промокод недействителен.")
         return
-    used, target_user_id = result
-    if used:
-        await message.answer("❌ Промокод уже использован.")
+    allowed_username = entry.get("username", "").lstrip("@").lower()
+    user_username = (message.from_user.username or "").lower()
+    if allowed_username and allowed_username != user_username:
+        await message.answer("❌ Промокод недействителен.")
         return
-    if target_user_id and target_user_id != message.from_user.id:
-        await message.answer("❌ Этот промокод не для вас.")
-        return
-    cursor.execute("UPDATE promocodes SET used = 1 WHERE code = ?", (code,))
-    set_rank(message.from_user.id, message.from_user.username or "unknown", "verified")
-    conn.commit()
-    await message.answer("✅ Вы получили ранг «Верифицированный»!")
+    entry["used"] = True
+    codes[code] = entry
+    await save_codes(codes)
+    await set_rank(message.from_user.id, RANK_VERIFIED)
+    await message.answer("✅ Промокод активирован! Вам выдана роль \"Верифицированный\".")
+
+
+FIAT_SYMBOLS = {
+    "RUB": "🇷🇺 Рубль",
+    "USD": "🇺🇸 Доллар",
+    "EUR": "🇪🇺 Евро",
+    "CNY": "🇨🇳 Юань",
+    "BYN": "🇧🇾 Белорусский рубль",
+    "GBP": "🇬🇧 Фунт",
+}
+
+CRYPTO_IDS = {
+    "bitcoin": "Биткоин",
+    "ethereum": "ETH",
+    "solana": "SOLARA",
+    "dogecoin": "DOGE",
+}
 
 
 @router.message(Command("currency"))
 async def cmd_currency(message: Message):
-    if get_rank(message.from_user.id) not in ("verified", "owner"):
-        await message.answer("Вы не можете выполнить эту команду, так как у вас нет нужного ранга.")
+    rank = await get_rank(message.from_user.id)
+    if rank not in (RANK_VERIFIED, RANK_OWNER):
+        await message.answer(NO_RIGHTS_TEXT)
         return
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.exchangerate-api.com/v4/latest/USD") as r:
-                data = await r.json()
-            rates = data.get("rates", {})
-            async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,dogecoin&vs_currencies=usd") as r:
-                crypto = await r.json()
-        text = "💱 <b>Курс валют (USD):</b>\n\n"
-        text += f"🇷🇺 Рубль: {rates.get('RUB', 'N/A')}₽\n"
-        text += f"🇺🇸 Доллар: 1$\n"
-        text += f"🇪🇺 Евро: {rates.get('EUR', 'N/A')}€\n"
-        text += f"🇨🇳 Юань: {rates.get('CNY', 'N/A')}¥\n"
-        text += f"🇧🇾 Бел. рубль: {rates.get('BYN', 'N/A')} Br\n"
-        text += f"🇬🇧 Фунт: £{rates.get('GBP', 'N/A')}\n\n"
-        text += "🪙 <b>Криптовалюты (USD):</b>\n\n"
-        text += f"₿ Bitcoin: ${crypto.get('bitcoin', {}).get('usd', 'N/A')}\n"
-        text += f"Ξ Ethereum: ${crypto.get('ethereum', {}).get('usd', 'N/A')}\n"
-        text += f"◎ Solana: ${crypto.get('solana', {}).get('usd', 'N/A')}\n"
-        text += f"🐕 Dogecoin: ${crypto.get('dogecoin', {}).get('usd', 'N/A')}"
-        await message.answer(text)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка получения курса: {e}")
+
+    lines = ["💱 Курс валют к доллару (USD):\n"]
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                fiat_data = await resp.json()
+            rates = fiat_data.get("rates", {})
+            for code, label in FIAT_SYMBOLS.items():
+                rate = rates.get(code)
+                if rate:
+                    lines.append(f"{label}: {rate:.2f}")
+        except Exception:
+            lines.append("Не удалось получить курсы фиатных валют.")
+
+        try:
+            ids = ",".join(CRYPTO_IDS.keys())
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                crypto_data = await resp.json()
+            lines.append("")
+            for cid, label in CRYPTO_IDS.items():
+                price = crypto_data.get(cid, {}).get("usd")
+                if price:
+                    lines.append(f"{label}: {price:,.2f} $")
+        except Exception:
+            lines.append("Не удалось получить курсы криптовалют.")
+
+    await message.answer("\n".join(lines))
+
+
+ALLOWED_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.Mod: operator.mod,
+    ast.FloorDiv: operator.floordiv,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("Недопустимое значение")
+    if isinstance(node, ast.BinOp) and type(node.op) in ALLOWED_OPERATORS:
+        return ALLOWED_OPERATORS[type(node.op)](_eval_node(node.left), _eval_node(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in ALLOWED_OPERATORS:
+        return ALLOWED_OPERATORS[type(node.op)](_eval_node(node.operand))
+    raise ValueError("Недопустимое выражение")
+
+
+def safe_eval(expr: str):
+    node = ast.parse(expr, mode="eval").body
+    return _eval_node(node)
+
 
 @router.message(Command("calculator"))
-async def cmd_calculator(message: Message, command: CommandObject):
-    if get_rank(message.from_user.id) not in ("verified", "owner"):
-        await message.answer("Вы не можете выполнить эту команду, так как у вас нет нужного ранга.")
+async def cmd_calculator(message: Message):
+    rank = await get_rank(message.from_user.id)
+    if rank not in (RANK_VERIFIED, RANK_OWNER):
+        await message.answer(NO_RIGHTS_TEXT)
         return
-    if not command.args:
-        await message.answer("Введите пример: /calculator 2+2*2")
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Укажите пример: /calculator 2+2*2")
         return
     try:
-        result = eval(command.args)
-        await message.answer(f"🔢 <b>Результат:</b> {result}")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        result = safe_eval(parts[1].strip())
+        await message.answer(f"🧮 Результат: {result}")
+    except Exception:
+        await message.answer("❌ Не удалось решить пример. Проверьте выражение.")
 
-@router.message(Command("ai"))
-async def cmd_ai(message: Message, command: CommandObject):
-    if get_rank(message.from_user.id) not in ("verified", "owner"):
-        await message.answer("Вы не можете выполнить эту команду, так как у вас нет нужного ранга.")
-        return
-    if not command.args:
-        await message.answer("Введите текст: /ai <текст>")
-        return
-    user_text = command.args
-    await message.answer("🤖 Думаю...")
+
+async def _ask_openrouter(prompt: str) -> Optional[str]:
     try:
         async with aiohttp.ClientSession() as session:
-            url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-            payload = {
-                "model": "meta-llama/llama-3.1-8b-instruct:free",
-                "messages": [{"role": "user", "content": user_text}]
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
             }
-            async with session.post(url, headers=headers, json=payload, timeout=30) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    response = data["choices"][0]["message"]["content"]
-                    await message.answer(f"🤖 <b>Ответ ИИ:</b>\n\n{response}")
-                    return
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-            payload = {
-                "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "user", "content": user_text}]
+            payload = {"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}]}
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+
+async def _ask_groq(prompt: str) -> Optional[str]:
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
             }
-            async with session.post(url, headers=headers, json=payload, timeout=30) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    response = data["choices"][0]["message"]["content"]
-                    await message.answer(f"🤖 <b>Ответ ИИ:</b>\n\n{response}")
-                else:
-                    await message.answer("❌ ИИ недоступен.")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка ИИ: {e}")
+            payload = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}]}
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+
+@router.message(Command("ai"))
+async def cmd_ai(message: Message):
+    rank = await get_rank(message.from_user.id)
+    if rank not in (RANK_VERIFIED, RANK_OWNER):
+        await message.answer(NO_RIGHTS_TEXT)
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Укажите текст запроса: /ai текст")
+        return
+    prompt = parts[1].strip()
+    await message.bot.send_chat_action(message.chat.id, "typing")
+
+    answer = None
+    if OPENROUTER_API_KEY:
+        answer = await _ask_openrouter(prompt)
+    if answer is None and GROQ_API_KEY:
+        answer = await _ask_groq(prompt)
+
+    if answer is None:
+        await message.answer("❌ Не удалось получить ответ от ИИ.")
+    else:
+        await message.answer(answer)
+
 
 @router.message(Command("verifiedchat"))
 async def cmd_verifiedchat(message: Message):
-    if get_rank(message.from_user.id) not in ("verified", "owner"):
-        await message.answer("Вы не можете выполнить эту команду, так как у вас нет нужного ранга.")
+    rank = await get_rank(message.from_user.id)
+    if rank not in (RANK_VERIFIED, RANK_OWNER):
+        await message.answer(NO_RIGHTS_TEXT)
         return
-    await message.answer("✅ Наш чат – https://t.me/LuxoGramTalk.")
+    await message.answer("✅ Наш чат – https://t.me/LuxoGramTalk.", disable_web_page_preview=True)
+
 
 @router.message(Command("chance"))
-async def cmd_chance(message: Message, command: CommandObject):
-    if get_rank(message.from_user.id) not in ("verified", "owner"):
-        await message.answer("Вы не можете выполнить эту команду, так как у вас нет нужного ранга.")
+async def cmd_chance(message: Message):
+    rank = await get_rank(message.from_user.id)
+    if rank not in (RANK_VERIFIED, RANK_OWNER):
+        await message.answer(NO_RIGHTS_TEXT)
         return
-    if not command.args or " или " not in command.args:
-        await message.answer("Введите: /chance вариант1 или вариант2")
-        return
-    parts = command.args.split(" или ", 1)
-    choice = random.choice([p.strip() for p in parts])
-    await message.answer(f"🎲 <b>Выбор сделан:</b>\n\n{choice}")
 
-cubes_data = {}
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Укажите варианты: /chance месси или роналдо")
+        return
+    text = parts[1].strip()
+    if " или " in text:
+        options = [opt.strip() for opt in text.split(" или ") if opt.strip()]
+    else:
+        options = [opt.strip() for opt in text.split() if opt.strip()]
+    if len(options) < 2:
+        await message.answer("Укажите минимум два варианта через \"или\".")
+        return
+    await message.answer(f"🎯 Выбор: {random.choice(options)}")
+
+
+active_dice_games: dict = {}
+
 
 @router.message(Command("cubes"))
-async def cmd_cubes(message: Message, command: CommandObject):
-    if get_rank(message.from_user.id) not in ("verified", "owner"):
-        await message.answer("Вы не можете выполнить эту команду, так как у вас нет нужного ранга.")
+async def cmd_cubes(message: Message):
+    rank = await get_rank(message.from_user.id)
+    if rank not in (RANK_VERIFIED, RANK_OWNER):
+        await message.answer(NO_RIGHTS_TEXT)
         return
-    if not command.args:
-        await message.answer("Укажите юзернейм: /cubes @username")
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().startswith("@"):
+        await message.answer("Укажите пользователя: /cubes @username")
         return
-    target = command.args.strip().replace("@", "")
-    target_user = None
-    async for member in message.bot.get_chat_administrators(message.chat.id) if message.chat.type != "private" else []:
-        if member.user.username and member.user.username.lower() == target.lower():
-            target_user = member.user
-            break
-    if not target_user:
-        await message.answer("❌ Пользователь не найден в этом чате. Добавьте его в чат и попробуйте снова, или введите правильный @username.")
+    target_username = parts[1].strip().lstrip("@")
+    initiator_username = message.from_user.username or str(message.from_user.id)
+
+    if target_username.lower() == initiator_username.lower():
+        await message.answer("❌ Нельзя предложить кубики самому себе.")
         return
-    inviter = message.from_user
-    cubes_data[target_user.id] = {"inviter": inviter, "target": target_user}
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Принять", callback_data=f"cubes_accept:{target_user.id}"),
-            InlineKeyboardButton(text="❌ Отказать", callback_data=f"cubes_decline:{target_user.id}")
-        ]
-    ])
+
+    game_id = f"{message.chat.id}_{message.message_id}"
+    active_dice_games[game_id] = {
+        "initiator_username": initiator_username,
+        "target_username": target_username,
+    }
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Принять", callback_data=f"cubes_accept:{game_id}")
+    builder.button(text="❌ Отказать", callback_data=f"cubes_decline:{game_id}")
+
     await message.answer(
-        f"@{target_user.username} минуточку внимания!\n"
-        f"@{inviter.username} предлагает вам бросить кубики.",
-        reply_markup=keyboard
+        f"@{target_username} минуточку внимания!\n"
+        f"@{initiator_username} предлагает вам бросить кубики.",
+        reply_markup=builder.as_markup(),
     )
 
-@router.callback_query(F.data.startswith("cubes_accept:"))
-async def cubes_accept(callback: CallbackQuery):
-    target_user_id = int(callback.data.split(":")[1])
-    data = cubes_data.get(target_user_id)
-    if not data:
-        await callback.answer("❌ Игра не найдена.")
-        return
-    inviter = data["inviter"]
-    target = data["target"]
-    if callback.from_user.id != target_user_id:
-        await callback.answer("❌ Это не ваша игра.")
-        return
-    roll1 = random.randint(1, 6)
-    await callback.message.answer(f"Первый бросок кубика совершает @{target.username}\n🎲 {roll1}")
-    await asyncio.sleep(1)
-    roll2 = random.randint(1, 6)
-    await callback.message.answer(f"Второй бросок кубика совершает @{inviter.username}\n🎲 {roll2}")
-    await asyncio.sleep(1)
-    if roll1 > roll2:
-        winner, loser = target, inviter
-    elif roll2 > roll1:
-        winner, loser = inviter, target
-    else:
-        await callback.message.answer("🤝 Ничья! Кубики равны.")
-        del cubes_data[target_user_id]
-        return
-    await callback.message.answer(
-        f"Игроки бросили кубики.\n"
-        f"👑 Победитель – @{winner.username}\n"
-        f"✖ Проигравший – @{loser.username}"
-    )
-    del cubes_data[target_user_id]
 
 @router.callback_query(F.data.startswith("cubes_decline:"))
-async def cubes_decline(callback: CallbackQuery):
-    target_user_id = int(callback.data.split(":")[1])
-    data = cubes_data.get(target_user_id)
-    if not data:
-        await callback.answer("❌ Игра не найдена.")
+async def cb_cubes_decline(callback: CallbackQuery):
+    game_id = callback.data.split(":", 1)[1]
+    game = active_dice_games.get(game_id)
+    if not game:
+        await callback.answer("Игра не найдена.", show_alert=True)
         return
-    inviter = data["inviter"]
-    target = data["target"]
-    if callback.from_user.id != target_user_id:
-        await callback.answer("❌ Это не ваша игра.")
+
+    responder_username = callback.from_user.username or ""
+    if responder_username.lower() != game["target_username"].lower():
+        await callback.answer("Это предложение не для вас.", show_alert=True)
         return
-    await callback.message.answer(
-        f"@{inviter.username} минуточку внимания! "
-        f"@{target.username} отказался бросить кубики."
+
+    await callback.message.edit_text(
+        f"@{game['initiator_username']} минуточку внимания! "
+        f"@{game['target_username']} отказался бросить кубики."
     )
-    del cubes_data[target_user_id]
+    active_dice_games.pop(game_id, None)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cubes_accept:"))
+async def cb_cubes_accept(callback: CallbackQuery):
+    game_id = callback.data.split(":", 1)[1]
+    game = active_dice_games.get(game_id)
+    if not game:
+        await callback.answer("Игра не найдена.", show_alert=True)
+        return
+
+    responder_username = callback.from_user.username or ""
+    if responder_username.lower() != game["target_username"].lower():
+        await callback.answer("Это предложение не для вас.", show_alert=True)
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer()
+
+    target_username = game["target_username"]
+    initiator_username = game["initiator_username"]
+
+    await callback.message.answer(f"Первый бросок кубика совершает @{target_username}.")
+    first_roll = random.randint(1, 6)
+    await callback.message.answer(f"🎲 {first_roll}")
+
+    await callback.message.answer(f"Второй бросок кубика совершает @{initiator_username}.")
+    second_roll = random.randint(1, 6)
+    await callback.message.answer(f"🎲 {second_roll}")
+
+    if first_roll == second_roll:
+        await callback.message.answer(f"Игроки бросили кубики.\nНичья! Оба выбросили {first_roll}.")
+    else:
+        if first_roll > second_roll:
+            winner, loser = target_username, initiator_username
+        else:
+            winner, loser = initiator_username, target_username
+        await callback.message.answer(
+            "Игроки бросили кубики.\n"
+            f"👑 Победитель – @{winner}\n"
+            f"✖ Проигравший – @{loser}"
+        )
+
+    active_dice_games.pop(game_id, None)
 
 
 @router.message(Command("passcreate"))
-async def cmd_passcreate(message: Message, command: CommandObject):
+async def cmd_passcreate(message: Message):
     if message.from_user.id != OWNER_ID:
+        await message.answer(NO_RIGHTS_TEXT)
         return
-    if not command.args:
-        await message.answer("Использование: /passcreate <промокод> @username")
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[2].strip().startswith("@"):
+        await message.answer("Использование: /passcreate текст @username")
         return
-    args = command.args
-    if " " not in args:
-        await message.answer("Укажите промокод и @username")
-        return
-    parts = args.rsplit(" ", 1)
-    code = parts[0].strip()
-    target_username = parts[1].strip().replace("@", "")
-    cursor.execute("SELECT user_id FROM users WHERE username = ?", (target_username,))
-    result = cursor.fetchone()
-    if not result:
-        await message.answer("❌ Пользователь не найден. Он должен сначала написать /start боту.")
-        return
-    target_user_id = result[0]
-    try:
-        cursor.execute("INSERT INTO promocodes (code, used, target_user_id) VALUES (?, 0, ?)", (code, target_user_id))
-        conn.commit()
-        await message.answer(f"✅ Промокод <code>{code}</code> создан для @{target_username}")
-    except sqlite3.IntegrityError:
-        await message.answer("❌ Такой промокод уже существует.")
+    code = parts[1]
+    username = parts[2].strip().lstrip("@")
+    codes = await get_codes()
+    codes[code] = {"username": username, "used": False}
+    await save_codes(codes)
+    await message.answer(f"✅ Промокод \"{code}\" создан для @{username}.")
+
 
 @router.message(Command("pickup"))
-async def cmd_pickup(message: Message, command: CommandObject):
+async def cmd_pickup(message: Message):
     if message.from_user.id != OWNER_ID:
+        await message.answer(NO_RIGHTS_TEXT)
         return
-    if not command.args:
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().startswith("@"):
         await message.answer("Использование: /pickup @username")
         return
-    target_username = command.args.strip().replace("@", "")
-    cursor.execute("UPDATE users SET rank = 'unverified' WHERE username = ?", (target_username,))
-    if cursor.rowcount > 0:
-        conn.commit()
-        await message.answer(f"✅ У @{target_username} забрана верификация.")
-    else:
+    username = parts[1].strip().lstrip("@")
+    found = await find_user_by_username(username)
+    if not found:
         await message.answer("❌ Пользователь не найден.")
+        return
+    uid, _info = found
+    await set_rank(int(uid), RANK_UNVERIFIED)
+    await message.answer(f"✅ У @{username} забрана верификация.")
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN не задан в переменных окружения.")
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
