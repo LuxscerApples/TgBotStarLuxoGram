@@ -28,6 +28,7 @@ DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 USERS_FILE = DATA_DIR / "users.json"
 CODES_FILE = DATA_DIR / "codes.json"
+THEMES_FILE = DATA_DIR / "themes.json"
 
 RANK_UNVERIFIED = "unverified"
 RANK_VERIFIED = "verified"
@@ -77,6 +78,19 @@ async def get_codes() -> dict:
 async def save_codes(data: dict) -> None:
     async with storage_lock:
         _write_json(CODES_FILE, data)
+
+
+async def get_themes() -> dict:
+    async with storage_lock:
+        data = _read_json(THEMES_FILE)
+        if "themes" not in data:
+            data = {"next_id": 1, "themes": {}}
+        return data
+
+
+async def save_themes(data: dict) -> None:
+    async with storage_lock:
+        _write_json(THEMES_FILE, data)
 
 
 async def ensure_user(user_id: int, username: Optional[str]) -> dict:
@@ -144,10 +158,13 @@ HELP_TEXT = (
     "/questionnaire – анкета пользователя\n"
     "/chance текст или текст – рандомный выбор\n"
     "/cubes @юз – бросить кубики\n"
-    "/search текст – поиск в Яндексе\n\n"
+    "/search текст – поиск в Яндексе\n"
+    "/createtheme название тема – создать тему\n"
+    "/themes – список всех тем\n\n"
     "🔹 Управляющий:\n"
     "/passcreate текст @юз – создать промокод\n"
-    "/pickup @юз – забрать верификацию\n\n"
+    "/pickup @юз – забрать верификацию\n"
+    "/removetheme айди – удалить тему\n\n"
 )
 
 GUIDE_TEXT = (
@@ -216,8 +233,6 @@ async def cmd_activate(message: Message):
     await save_codes(codes)
     await set_rank(message.from_user.id, RANK_VERIFIED)
     await message.answer("✅ Промокод активирован! Вам выдана роль \"Верифицированный\".")
-
-
 
 
 FIAT_SYMBOLS = {
@@ -558,7 +573,6 @@ async def cmd_pickup(message: Message):
     await message.answer(f"✅ У @{username} забрана верификация.")
 
 
-
 @router.message(Command(commands=["search"]))
 async def cmd_search(message: Message):
     rank = await get_rank(message.from_user.id)
@@ -588,6 +602,84 @@ async def cmd_botinfo(message: Message):
         "📊 Стадия в разработке: Beta."
     )
     await message.answer(info_text)
+
+
+@router.message(Command("createtheme"))
+async def cmd_createtheme(message: Message):
+    rank = await get_rank(message.from_user.id)
+    if rank not in (RANK_VERIFIED, RANK_OWNER):
+        await message.answer(NO_RIGHTS_TEXT)
+        return
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].strip() or not parts[2].strip():
+        await message.answer("Использование: /createtheme название суть_темы\nПример: /createtheme Программирование Обсуждение языков, библиотек и проектов.")
+        return
+
+    title = parts[1].strip()
+    description = parts[2].strip()
+
+    themes_data = await get_themes()
+    theme_id = str(themes_data["next_id"])
+    themes_data["themes"][theme_id] = {
+        "title": title,
+        "description": description,
+        "creator_id": message.from_user.id,
+        "creator_username": message.from_user.username or str(message.from_user.id)
+    }
+    themes_data["next_id"] += 1
+    await save_themes(themes_data)
+
+    await message.answer(f"✅ Тема создана!\nID: {theme_id}\nНазвание: {title}\nСуть: {description}")
+
+
+@router.message(Command("themes"))
+async def cmd_themes(message: Message):
+    rank = await get_rank(message.from_user.id)
+    if rank not in (RANK_VERIFIED, RANK_OWNER):
+        await message.answer(NO_RIGHTS_TEXT)
+        return
+
+    themes_data = await get_themes()
+    themes = themes_data.get("themes", {})
+
+    if not themes:
+        await message.answer("📋 Пока нет ни одной темы.")
+        return
+
+    lines = ["📋 Список тем:\n"]
+    for tid, info in sorted(themes.items(), key=lambda x: int(x[0])):
+        creator = f"@{info['creator_username']}" if info.get('creator_username') else "Неизвестно"
+        lines.append(f"🆔 ID: {tid}")
+        lines.append(f"📌 Название: {info['title']}")
+        lines.append(f"📝 Суть: {info['description']}")
+        lines.append(f"👤 Создатель: {creator}")
+        lines.append("")
+
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("removetheme"))
+async def cmd_removetheme(message: Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer(NO_RIGHTS_TEXT)
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /removetheme айди_темы")
+        return
+
+    theme_id = parts[1].strip()
+    themes_data = await get_themes()
+
+    if theme_id not in themes_data.get("themes", {}):
+        await message.answer("❌ Тема с таким ID не найдена.")
+        return
+
+    del themes_data["themes"][theme_id]
+    await save_themes(themes_data)
+    await message.answer(f"✅ Тема с ID {theme_id} удалена.")
 
 
 async def main():
