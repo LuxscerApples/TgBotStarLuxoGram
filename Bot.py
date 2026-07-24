@@ -162,7 +162,8 @@ HELP_TEXT = (
     "/createtheme название тема – создать тему\n"
     "/themes – список всех тем\n\n"
     "🔹 Управляющий:\n"
-    "/passcreate текст @юз – создать промокод\n"
+    "/passcreate текст @юз – создать промокод для пользователя\n"
+    "/passcreate текст @all – создать глобальный промокод (для всех)\n"
     "/pickup @юз – забрать верификацию\n"
     "/removetheme айди – удалить тему\n\n"
 )
@@ -213,21 +214,28 @@ async def cmd_guide(message: Message):
 @router.message(Command("activate"))
 async def cmd_activate(message: Message):
     await ensure_user(message.from_user.id, message.from_user.username)
+    
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await message.answer("Укажите промокод: /activate текст")
         return
+    
     code = parts[1].strip()
     codes = await get_codes()
     entry = codes.get(code)
+    
     if not entry or entry.get("used"):
         await message.answer("❌ Промокод недействителен.")
         return
-    allowed_username = entry.get("username", "").lstrip("@").lower()
+
+    allowed_username = str(entry.get("username", "")).strip().lower()
     user_username = (message.from_user.username or "").lower()
-    if allowed_username and allowed_username != user_username:
-        await message.answer("❌ Промокод недействителен.")
-        return
+
+    if allowed_username and allowed_username not in ("", "all"):
+        if allowed_username != user_username:
+            await message.answer("❌ Промокод недействителен.")
+            return
+
     entry["used"] = True
     codes[code] = entry
     await save_codes(codes)
@@ -542,10 +550,25 @@ async def cmd_passcreate(message: Message):
         return
 
     parts = message.text.split(maxsplit=2)
-    if len(parts) < 3 or not parts[2].strip().startswith("@"):
-        await message.answer("Использование: /passcreate текст @username")
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /passcreate текст [@username | @all]")
         return
-    code = parts[1]
+
+    code = parts[1].strip()
+
+    if len(parts) > 2:
+        target = parts[2].strip().lower()
+        if target == "@all":
+            codes = await get_codes()
+            codes[code] = {"username": "", "used": False, "global": True}
+            await save_codes(codes)
+            await message.answer(f"✅ **Глобальный** промокод \"{code}\" создан для **всех пользователей**.")
+            return
+
+    if len(parts) < 3 or not parts[2].strip().startswith("@"):
+        await message.answer("Использование: /passcreate текст [@username | @all]")
+        return
+
     username = parts[2].strip().lstrip("@")
     codes = await get_codes()
     codes[code] = {"username": username, "used": False}
