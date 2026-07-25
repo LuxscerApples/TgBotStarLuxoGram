@@ -11,7 +11,7 @@ import urllib.parse
 import aiohttp
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineQuery, InlineQueryResultArticle, InputTextMessageContent
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import logging
@@ -177,6 +177,23 @@ GUIDE_TEXT = (
     "3) Ждать, если ты подходишь, тебе напишут в лс или в ответ на сообщение."
 )
 
+BOTINFO_TEXT = (
+    "📄 Язык программирования: Python.\n"
+    "📚 Библиотека: Aiogram.\n"
+    "👨‍💻 Кодер: @Luxscer.\n"
+    "📊 Стадия в разработке: Готов."
+)
+
+BOTINFO_INLINE_TEXT = (
+    "Информация о боте:\n"
+    "📄 Язык программирования: Python.\n"
+    "📚 Библиотека: Aiogram.\n"
+    "👨‍💻 Кодер: @Luxscer.\n"
+    "📊 Стадия в разработке: Готов."
+)
+
+SITE_TEXT = "🖥 Наш сайт: https://starluxogram.site/"
+
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -215,7 +232,7 @@ async def cmd_guide(message: Message):
 @router.message(Command("site"))
 async def cmd_site(message: Message):
     await ensure_user(message.from_user.id, message.from_user.username)
-    await message.answer("💻Наш сайт: https://starluxogram.site/")
+    await message.answer(SITE_TEXT)
 
 
 @router.message(Command("activate"))
@@ -624,14 +641,7 @@ async def cmd_search(message: Message):
 @router.message(Command(commands=["botinfo"]))
 async def cmd_botinfo(message: Message):
     await ensure_user(message.from_user.id, message.from_user.username)
-    info_text = (
-        "Информация о боте:\n"
-        "📄 Язык программирования: Python.\n"
-        "📚 Библиотека: Aiogram.\n"
-        "👨‍💻 Кодер: @Luxscer.\n"
-        "📊 Стадия в разработке: Beta."
-    )
-    await message.answer(info_text)
+    await message.answer(BOTINFO_TEXT)
 
 
 @router.message(Command("createtheme"))
@@ -710,6 +720,52 @@ async def cmd_removetheme(message: Message):
     del themes_data["themes"][theme_id]
     await save_themes(themes_data)
     await message.answer(f"✅ Тема с ID {theme_id} удалена.")
+
+
+@router.inline_query()
+async def inline_handler(inline_query: InlineQuery):
+    query = (inline_query.query or "").strip().lower()
+    results = []
+
+    if not query or "бот" in query or "инфо" in query or "bot" in query:
+        results.append(
+            InlineQueryResultArticle(
+                id="botinfo",
+                title="Бот инфо",
+                description="Бот инфо.",
+                input_message_content=InputTextMessageContent(message_text=BOTINFO_INLINE_TEXT),
+            )
+        )
+
+    if not query or "сайт" in query or "site" in query:
+        results.append(
+            InlineQueryResultArticle(
+                id="site",
+                title="Сайт",
+                description="Сайт",
+                input_message_content=InputTextMessageContent(message_text=SITE_TEXT),
+            )
+        )
+
+    if not results:
+        results.append(
+            InlineQueryResultArticle(
+                id="botinfo",
+                title="Бот инфо",
+                description="Бот инфо.",
+                input_message_content=InputTextMessageContent(message_text=BOTINFO_INLINE_TEXT),
+            )
+        )
+        results.append(
+            InlineQueryResultArticle(
+                id="site",
+                title="Сайт",
+                description="Сайт",
+                input_message_content=InputTextMessageContent(message_text=SITE_TEXT),
+            )
+        )
+
+    await inline_query.answer(results, cache_time=1, is_personal=True)
 
 
 async def main():
