@@ -191,8 +191,6 @@ BOTINFO_INLINE_TEXT = (
     "📊 Стадия в разработке: Готов."
 )
 
-SITE_TEXT = "🖥 Наш сайт: https://starluxogram.site/"
-
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -226,12 +224,6 @@ async def cmd_questionnaire(message: Message):
 async def cmd_guide(message: Message):
     await ensure_user(message.from_user.id, message.from_user.username)
     await message.answer(GUIDE_TEXT, disable_web_page_preview=True)
-
-
-@router.message(Command("site"))
-async def cmd_site(message: Message):
-    await ensure_user(message.from_user.id, message.from_user.username)
-    await message.answer(SITE_TEXT)
 
 
 @router.message(Command("activate"))
